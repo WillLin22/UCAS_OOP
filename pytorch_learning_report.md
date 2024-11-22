@@ -375,37 +375,75 @@ def _internal_new_from_data(
     # guaranteeing a fresh tensor in this case
     return tensor
 ```
+
 可以看到这里的函数主要进行了一些关于device、存储类型等参数的检查，但这还没结束。经过层层分离后如今的给tensor传入的列表[1, 2, 3]几乎就只剩下了数据（data）和类型（inferred_scalar_type）的空架子，接下来调用了`_recursive_build`函数来真正将数据转化为tensor。
 
-# Module 分析
+由于底层实现主要通过C++来实现存储、运算的支持，这并不在我们目前的分析范围内，因此对tensor的创建过程的分析就到此为止。
 
-作为一个“容器”，
+在C++源代码中同样存在一个对应的Tensor类，位于torch命名空间中。上层的所有Tensor的运算方法都有一个对应的底层实现函数。这允许我们通过给该类定义新的方法、编译成动态链接库来扩展对Tensor的算子，可扩展性得到保障。缺点则是我认为该扩展方法封装得还不够彻底：python或C++完全可以只提供一个扩展接口、通过提供扩展名、扩展操作函数等来实现整个扩展过程，而不是如setuptools般仅实现编译接口，程序员自身还需要自行编写整个C++函数。
 
-让我们先来分析一下其内包含的参数，主要陈列如下：
+# Module 核心设计流程分析
+
+我们已经在第一章里面简单阐述了一个自定义的module的从创建到应用的一个大体流程。下面我们从面向对象的角度仔细地分析一下这个过程的值得品味之处：
+
+1. 关于forward的多态：通过虚函数来进行。但由于python不直接支持虚函数和虚类机制，因此采用了间接的方法：在Module初始化时将forward函数赋值为_forward_unimplemented，若子类没有重载forward函数的话那么直接调用这个函数会产生一个异常，这保证了每个子类都得自定义一个forward函数，实现了类似于虚函数的性质。
+```python
+    # Trick mypy into not applying contravariance rules to inputs by defining
+    # forward as a value, rather than a function.  See also
+    # https://github.com/python/mypy/issues/8795
+    def _forward_unimplemented(self, *input: Any) -> None:
+
+    raise NotImplementedError(
+        f'Module [{type(self).__name__}] is missing the required "forward" function'
+    )
+
+    class Module:
+        __init__(...):
+            ...
+            forward: Callable[..., Any] = _forward_unimplemented
+```
+2. 注册的概念：简而言之就是“令这个实例知道你的存在”。注册后的实例可以被新建的Module实例所知，从而可以在内置方法中根据其进行操作而不会对方法产生任何修改需求。
+3. 高内聚与开闭原则的实现：Module中通过大量字典来实现钩子函数、参数和模块的注册，而不对其进行任何操作，仅仅只是一种记录。而所有的内置方法均是对Module参数的修改（如注册函数便是在对应字典里面添加新的映射等）。所有操作空间全部预留给子类，便于子类实现个性化的操作封装。同样对应的，子类对这些记录的操作则只需要调用父类留下的这些接口就行，子类仅仅负责的是功能的具体实现。
+
+让我们举个例子来更准确地说明这一点：以nn.Sequential为例，该子类允许你简单地将各个模块实例添加进入其实例，该类的实例即可在forward时顺序地将前一个添加进去的模块的输出连接到后一个模块的输入、最后得到最终输出。
 
 ```python
-    #A boolean flag that is used for debugging or patching purposes.
-    dump_patches: bool = False 
-    _version: int = 1 #
-    training: bool
-    _parameters: Dict[str, Optional[Parameter]]
-    _buffers: Dict[str, Optional[Tensor]]
-    _non_persistent_buffers_set: Set[str]
-    _backward_pre_hooks: Dict[int, Callable]
-    _backward_hooks: Dict[int, Callable]
-    _is_full_backward_hook: Optional[bool]
-    _forward_hooks: Dict[int, Callable]
-    _forward_hooks_with_kwargs: Dict[int, bool]    
-    _forward_hooks_always_called: Dict[int, bool]
-    _forward_pre_hooks: Dict[int, Callable]
-    _forward_pre_hooks_with_kwargs: Dict[int, bool]
-    _state_dict_hooks: Dict[int, Callable]
-    _load_state_dict_pre_hooks: Dict[int, Callable]
-    _state_dict_pre_hooks: Dict[int, Callable]
-    _load_state_dict_post_hooks: Dict[int, Callable]
-    _modules: Dict[str, Optional['Module']]
-    call_super_init: bool = False
-    _compiled_call_impl : Optional[Callable] = None
+class Sequential(Module):
+    #重写_modules，因为Sequential类必包含子模块，因此没有必要再采用映射到Optional的映射
+    _modules: Dict[str, Module]  # type: ignore[assignment]
+
+    @overload
+    def __init__(self, *args: Module) -> None:
+        ...
+
+    @overload
+    def __init__(self, arg: "OrderedDict[str, Module]") -> None:
+        ...
+
+    def __init__(self, *args):
+        super().__init__()
+        if len(args) == 1 and isinstance(args[0], OrderedDict):
+            for key, module in args[0].items():
+                self.add_module(key, module)
+        else:
+            for idx, module in enumerate(args):
+                self.add_module(str(idx), module)
+    
+    def forward(self, input):
+        for module in self:
+            input = module(input)
+        return input
 ```
 
-对`torch.nn.Module`类的主要建模如下：
+可以看到一个子类（扩展）只需要调用父模块提供的add_module的接口便可以轻松实现一个序列化的容器，而不必关心具体实现。同样地，外界在使用nn.Sequential容器时同样也无需关注其这些实现方法，直接实例化并使用即可，同样体现了开闭原则。
+
+# 高级设计意图分析
+
+## 模版模式
+
+可以明显地感受到pytorch的模版模式的应用之广泛。这主要是由pytorch的具体需求决定的：pytorch需要实现一种方法使得人们可以非常方便地去将模块进行组合和扩展，这种对多模块使用的支持是决定其使用模板模式的最根本原因。它已经将模板模式做到了极致。
+
+但我认为还是有一些问题有待提出：
+
+1. 基类方法保护：Module的类方法缺乏重载保护的存在，这固然为进一步的扩展提供了条件，但也为错误的函数名提供了风险。以`_`开头的函数按照约定是类内部的函数不应该被覆写，然而这只是一种约定，并没有像java中final关键字那样的强制性要求。同时，大量存在的对外接口函数同样可以被覆盖（尽管除了功能扩展需求外不会有人真的去做就是了）。
+2. 系统的复杂庞大：相比于一些其他项目的对接口实现的设计模式来说pytorch这种每个实现都要创建一个新的类的方法无疑是太庞大了。尤其是，在真正使用的时候事实上我们只会用到很小的一部分，但随着时间的发展凡是世界各地的论文中有出现的、获得一定认可的模块甚至算法都得单独写成一个类并单独编译出来，这不仅代表着持续维护的需求同时使得pytorch体系日趋庞大。

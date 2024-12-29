@@ -157,6 +157,7 @@ output = model(input_tensor)
 loss = criterion(output, target_tensor)
 ```
 ```python
+    __call__: Callable[..., Any] = _wrapped_call_impl
     def _wrapped_call_impl(self, *args, **kwargs):
         if self._compiled_call_impl is not None:
             return self._compiled_call_impl(*args, **kwargs)  # type: ignore[misc]
@@ -247,6 +248,10 @@ tensor的接口种类繁杂，数量庞大，但大部分都是各种对tensor�
 以此简单绘制类图如下：
 
 ![Tensor、nn.Module、nn.Models三者关系](./figs/classgraph.jpg)
+
+以下省略复杂的类中属性及方法，整体架构一览如下：
+
+![整体架构一览图](./figs/classgraph.png)
 
 # Tensor核心设计流程分析
 
@@ -399,7 +404,7 @@ def _internal_new_from_data(
 
     class Module:
         __init__(...):
-            ...
+            # some codes
             forward: Callable[..., Any] = _forward_unimplemented
 ```
 2. 注册的概念：简而言之就是“令这个实例知道你的存在”。注册后的实例可以被新建的Module实例所知，从而可以在内置方法中根据其进行操作而不会对方法产生任何修改需求。
@@ -437,6 +442,20 @@ class Sequential(Module):
 
 可以看到一个子类（扩展）只需要调用父模块提供的add_module的接口便可以轻松实现一个序列化的容器，而不必关心具体实现。同样地，外界在使用nn.Sequential容器时同样也无需关注其这些实现方法，直接实例化并使用即可，同样体现了开闭原则。
 
+4. _apply接口：将注册在Module中的信息均转化为对应device的内容，伪代码如下
+```python
+def _apply(self, fn, recurse=True):
+    for para in self._parameters:
+        para_applied = fn(para)
+        #对转化的para进行后续处理 
+    for key, item in self._buffers.items():
+        self._buffers[key] = fn(item)
+```
+
+以引言中给的示例代码为例，创建一个Module的初始化过程可以简单用如下流程图进行概括：
+
+![](./figs/flow.png)
+
 # 高级设计意图分析
 
 ## 模版模式
@@ -447,3 +466,61 @@ class Sequential(Module):
 
 1. 基类方法保护：Module的类方法缺乏重载保护的存在，这固然为进一步的扩展提供了条件，但也为错误的函数名提供了风险。以`_`开头的函数按照约定是类内部的函数不应该被覆写，然而这只是一种约定，并没有像java中final关键字那样的强制性要求。同时，大量存在的对外接口函数同样可以被覆盖（尽管除了功能扩展需求外不会有人真的去做就是了）。
 2. 系统的复杂庞大：相比于一些其他项目的对接口实现的设计模式来说pytorch这种每个实现都要创建一个新的类的方法无疑是太庞大了。尤其是，在真正使用的时候事实上我们只会用到很小的一部分，但随着时间的发展凡是世界各地的论文中有出现的、获得一定认可的模块甚至算法都得单独写成一个类并单独编译出来，这不仅代表着持续维护的需求同时使得pytorch体系日趋庞大。
+
+## 工厂模式
+
+使用于创建不同device、不同dtype的tensor中，tensor类通过提供工厂接口（如empty()中的device、dtype等参数），由底层C++负责具体的工厂函数的实现。
+
+在模块中常用来初始化这些模块的内置参数。以Linear和ConvNd为代表的创建如下。其中Tensor扮演简单工厂类的角色，提供给Module统一的工厂接口（在这里是torch.empty方法），使得Module只需要传入简单的参数：device还有dtype就能创建出不同的Tensor实例，从而创建出包含不同类型Tensor的Parameter。
+
+```python
+
+class Linear(Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        ...
+        self.weight = Parameter(
+            torch.empty((out_features, in_features), **factory_kwargs)
+        )
+        if bias:
+            self.bias = Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter("bias", None)
+        ...
+class _ConvNd(Module):
+    ...
+        def __init__(
+        self,
+        ...
+        device=None,
+        dtype=None,
+    ) -> None:
+        factory_kwargs = {"device": device, "dtype": dtype}
+        ...
+        if transposed:
+            self.weight = Parameter(
+                torch.empty(
+                    (in_channels, out_channels // groups, *kernel_size),
+                    **factory_kwargs,
+                )
+            )
+        else:
+            self.weight = Parameter(
+                torch.empty(
+                    (out_channels, in_channels // groups, *kernel_size),
+                    **factory_kwargs,
+                )
+            )
+        if bias:
+            self.bias = Parameter(torch.empty(out_channels, **factory_kwargs))
+        else:
+            self.register_parameter("bias", None)
+        ...
+```
